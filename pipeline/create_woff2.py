@@ -1,45 +1,86 @@
+import io
+import re
 import cv2
 import numpy as np
+import vtracer
+from PIL import Image as PILImage
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.pens.cu2quPen import Cu2QuPen
 from fontTools.ttLib.tables._g_l_y_f import Glyph as EmptyGlyph
 from fontTools.agl import UV2AGL
 
 UPM = 1000
 GLYPH_HEIGHT = 800
+CU2QU_MAX_ERR = 1.0
 
 ASCENDER = GLYPH_HEIGHT
 DESCENDER = GLYPH_HEIGHT - UPM
 
+# vtracer tuning — adjust these to trade smoothness vs. fidelity
+VTRACER_PARAMS = dict(
+    colormode      = "binary",
+    filter_speckle = 4,      # discard blobs smaller than this (px²)
+    corner_threshold = 60,   # angle (°) below which a point is a hard corner
+    length_threshold = 4.0,  # ignore path segments shorter than this
+    splice_threshold = 45,   # curve-fitting aggressiveness
+    path_precision   = 3,    # decimal places in SVG output
+)
+
+
+def _svg_to_pen(svg: str, pen, img_h: int, img_w: int):
+    """Parse vtracer SVG paths and replay them into a fontTools pen.
+
+    Applies a y-flip so image coords (origin top-left) become font coords
+    (origin bottom-left). vtracer outer contours are CCW in image space;
+    after flip they become CW — correct for TrueType.
+    Cu2QuPen (reverse_direction=True) handles any remaining winding issues.
+    """
+    scale = GLYPH_HEIGHT / img_h
+
+    def pt(x, y):
+        return (float(x) * scale, float(img_h - y) * scale)
+
+    # tokenise the path data from every <path d="..."> element
+    for path_data in re.findall(r'd="([^"]+)"', svg):
+        tokens = re.findall(r'[MCLZmclz]|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', path_data)
+        it = iter(tokens)
+        for tok in it:
+            if tok == 'M':
+                x, y = float(next(it)), float(next(it))
+                pen.moveTo(pt(x, y))
+            elif tok == 'C':
+                x1, y1 = float(next(it)), float(next(it))
+                x2, y2 = float(next(it)), float(next(it))
+                x,  y  = float(next(it)), float(next(it))
+                pen.curveTo(pt(x1, y1), pt(x2, y2), pt(x, y))
+            elif tok == 'L':
+                x, y = float(next(it)), float(next(it))
+                pen.lineTo(pt(x, y))
+            elif tok == 'Z':
+                pen.closePath()
+
 
 def ndarray_to_glyph(image: np.ndarray):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray     = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    h, w = binary.shape
-    scale = GLYPH_HEIGHT / h
+    # vtracer expects a PNG; encode in memory to avoid temp files
+    pil  = PILImage.fromarray(denoised)
+    buf  = io.BytesIO()
+    pil.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
 
-    def to_em(x, y):
-        # y-flip converts image coords (origin top-left) to font coords (origin bottom-left)
-        # After flip, OpenCV outer contours (CCW in image space) become CW — correct for TrueType
-        return (float(x) * scale, float(h - y) * scale)
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = denoised.shape
+    svg  = vtracer.convert_raw_image_to_svg(img_bytes, img_format="png", **VTRACER_PARAMS)
 
     tt_pen = TTGlyphPen(glyphSet=None)
-    for cnt in contours:
-        epsilon = max(0.5, 0.01 * cv2.arcLength(cnt, closed=True))
-        approx = cv2.approxPolyDP(cnt, epsilon, closed=True).reshape(-1, 2)
-        if len(approx) < 3:
-            continue
-        tt_pen.moveTo(to_em(*approx[0]))
-        for pt in approx[1:]:
-            tt_pen.lineTo(to_em(*pt))
-        tt_pen.closePath()
+    pen    = Cu2QuPen(tt_pen, max_err=CU2QU_MAX_ERR, reverse_direction=True)
 
-    glyph = tt_pen.glyph()
-    advance_width = int(w * scale + 100)
+    _svg_to_pen(svg, pen, h, w)
+
+    glyph        = tt_pen.glyph()
+    advance_width = int(w * (GLYPH_HEIGHT / h) + 100)
     return glyph, advance_width
 
 

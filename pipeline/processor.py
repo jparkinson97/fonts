@@ -9,9 +9,10 @@ import cv2
 import numpy as np
 import pytesseract
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
 
 from detect_character import segment_characters
-from classify_character import preprocess
+from classify_character_easyocr import preprocess
 
 from create_woff2 import create_woff2
 
@@ -27,7 +28,8 @@ def _classify_single(image: np.ndarray) -> str:
     return text.strip()
 
 
-def build_font(image_path: str, output_path: str, font_name: str = "CustomFont") -> dict[str, np.ndarray]:
+def build_char_dict(image_path: str) -> dict[str, list[np.ndarray]]:
+    """Returns all detected instances per character, in order of appearance."""
     t0 = time.perf_counter()
 
     t = time.perf_counter()
@@ -38,21 +40,26 @@ def build_font(image_path: str, output_path: str, font_name: str = "CustomFont")
         raise ValueError(f"No characters detected in {image_path}")
 
     t = time.perf_counter()
-    character_dict: dict[str, np.ndarray] = {}
-    for crop in crops:
-        char = _classify_single(crop)
-        if len(char) == 1 and char not in character_dict:
-            character_dict[char] = crop
+    with ThreadPoolExecutor() as pool:
+        pairs = list(zip(crops, pool.map(_classify_single, crops)))
+    character_dict: dict[str, list[np.ndarray]] = {}
+    for crop, char in pairs:
+        if len(char) == 1:
+            character_dict.setdefault(char, []).append(crop)
     _t(f"classify ({len(character_dict)} unique chars)", t)
 
     if not character_dict:
         raise ValueError("No characters could be classified")
 
+    _t("total", t0)
+    return character_dict
+
+
+def build_font(image_path: str, output_path: str, font_name: str = "CustomFont") -> dict[str, np.ndarray]:
+    character_dict = build_char_dict(image_path)
     t = time.perf_counter()
     create_woff2(character_dict, output_path, font_name)
     _t("create_woff2", t)
-
-    _t("total", t0)
     return character_dict
 
 

@@ -3,3 +3,11 @@
 /.python-version
 /.venv
 /.vscode
+
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/

@@ -1,0 +1,67 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tesseract
+        run: brew install tesseract
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-macos.txt
+
+      - name: Set Tesseract paths
+        run: |
+          echo "TESSERACT_PREFIX=$(brew --prefix tesseract)" >> $GITHUB_ENV
+          echo "LEPTONICA_PREFIX=$(brew --prefix leptonica)" >> $GITHUB_ENV
+
+      - name: Build
+        run: pyinstaller build.spec
+
+      - name: Zip app bundle
+        run: cd dist && zip -r "FontBuilder-macOS.zip" "Font Builder.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FontBuilder-macOS
+          path: dist/FontBuilder-macOS.zip
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tesseract
+        run: choco install tesseract --yes
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build
+        env:
+          TESSERACT_PREFIX: C:\Program Files\Tesseract-OCR
+        run: pyinstaller build.spec
+
+      - name: Zip output
+        run: Compress-Archive -Path dist\FontBuilder -DestinationPath dist\FontBuilder-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FontBuilder-Windows
+          path: dist\FontBuilder-Windows.zip

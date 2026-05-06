@@ -13,6 +13,7 @@ from fontTools.agl import UV2AGL
 UPM = 1000
 GLYPH_HEIGHT = 800
 CU2QU_MAX_ERR = 1.0
+OVERSAMPLE = 4  # upscale the crop before vtracer so sub-pixel detail (terminals, varying stroke width) survives
 
 ASCENDER = GLYPH_HEIGHT
 DESCENDER = GLYPH_HEIGHT - UPM
@@ -64,6 +65,13 @@ def _svg_to_pen(svg: str, pen, img_h: int, img_w: int):
 def ndarray_to_glyph(image: np.ndarray):
     gray     = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
+
+    if OVERSAMPLE != 1:
+        denoised = cv2.resize(
+            denoised,
+            (denoised.shape[1] * OVERSAMPLE, denoised.shape[0] * OVERSAMPLE),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
     # vtracer expects a PNG; encode in memory to avoid temp files
     pil  = PILImage.fromarray(denoised)

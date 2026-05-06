@@ -134,6 +134,32 @@ def create_woff2(char_arrays: dict[str, np.ndarray], output_path: str, font_name
     return font
 
 
+def generate_preview_ttf(char: str, crop: np.ndarray) -> bytes:
+    """Generate an in-memory TTF for a single character, for Qt preview use."""
+    name = _glyph_name(char)
+    glyph, advance_width = ndarray_to_glyph(crop)
+
+    fb = FontBuilder(UPM, isTTF=True)
+    fb.setupGlyphOrder([".notdef", name])
+    fb.setupCharacterMap({ord(char): name})
+    fb.setupGlyf({".notdef": EmptyGlyph(), name: glyph})
+    fb.setupHorizontalMetrics({".notdef": (UPM // 2, 0), name: (advance_width, 0)})
+    fb.setupHorizontalHeader(ascent=ASCENDER, descent=DESCENDER)
+    fb.setupNameTable({"familyName": "FontBuilderPreview", "styleName": "Regular"})
+    fb.setupOS2(
+        sTypoAscender=ASCENDER,
+        sTypoDescender=DESCENDER,
+        usWinAscent=ASCENDER,
+        usWinDescent=abs(DESCENDER),
+    )
+    fb.setupPost()
+    fb.setupHead(unitsPerEm=UPM)
+
+    buf = io.BytesIO()
+    fb.font.save(buf)
+    return buf.getvalue()
+
+
 def main():
     import sys
     import os

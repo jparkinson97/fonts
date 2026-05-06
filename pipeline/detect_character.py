@@ -66,6 +66,24 @@ def segment_characters(image: Union[str, np.ndarray]) -> list[np.ndarray]:
     return [img[y : y + h, x : x + w] for x, y, w, h in boxes]
 
 
+def segment_characters_with_boxes(
+    image: Union[str, np.ndarray],
+) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+    """
+    Segment an image and return both the original image and bounding boxes.
+
+    Args:
+        image: path to image file, or a BGR np.ndarray from cv2.imread.
+
+    Returns:
+        (original_image, boxes) where boxes is a list of (x, y, w, h) tuples
+        sorted in reading order.
+    """
+    img = _load(image)
+    boxes = _find_sorted_boxes(img)
+    return img, boxes
+
+
 def main():
     import sys
     import os

@@ -11,7 +11,7 @@ import pytesseract
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
 
-from detect_character import segment_characters
+from detect_character import segment_characters_with_boxes
 from classify_character_easyocr import preprocess
 
 from create_woff2 import create_woff2
@@ -28,12 +28,17 @@ def _classify_single(image: np.ndarray) -> str:
     return text.strip()
 
 
-def build_char_dict(image_path: str) -> dict[str, list[np.ndarray]]:
-    """Returns all detected instances per character, in order of appearance."""
+def build_char_dict(image_path: str) -> tuple[
+    dict[str, list[np.ndarray]],
+    dict[str, list[tuple[int, int, int, int]]],
+    np.ndarray,
+]:
+    """Returns (char_crops, char_boxes, original_image) for all detected characters."""
     t0 = time.perf_counter()
 
     t = time.perf_counter()
-    crops = segment_characters(image_path)
+    orig_img, boxes = segment_characters_with_boxes(image_path)
+    crops = [orig_img[y : y + h, x : x + w] for x, y, w, h in boxes]
     _t(f"segment_characters ({len(crops)} crops)", t)
 
     if not crops:
@@ -41,22 +46,25 @@ def build_char_dict(image_path: str) -> dict[str, list[np.ndarray]]:
 
     t = time.perf_counter()
     with ThreadPoolExecutor() as pool:
-        pairs = list(zip(crops, pool.map(_classify_single, crops)))
-    character_dict: dict[str, list[np.ndarray]] = {}
-    for crop, char in pairs:
-        if len(char) == 1:
-            character_dict.setdefault(char, []).append(crop)
-    _t(f"classify ({len(character_dict)} unique chars)", t)
+        chars = list(pool.map(_classify_single, crops))
 
-    if not character_dict:
+    char_dict: dict[str, list[np.ndarray]] = {}
+    box_dict:  dict[str, list[tuple[int, int, int, int]]] = {}
+    for (crop, box), char in zip(zip(crops, boxes), chars):
+        if len(char) == 1:
+            char_dict.setdefault(char, []).append(crop)
+            box_dict.setdefault(char, []).append(box)
+    _t(f"classify ({len(char_dict)} unique chars)", t)
+
+    if not char_dict:
         raise ValueError("No characters could be classified")
 
     _t("total", t0)
-    return character_dict
+    return char_dict, box_dict, orig_img
 
 
 def build_font(image_path: str, output_path: str, font_name: str = "CustomFont") -> dict[str, np.ndarray]:
-    character_dict = build_char_dict(image_path)
+    character_dict, _, _ = build_char_dict(image_path)
     t = time.perf_counter()
     create_woff2(character_dict, output_path, font_name)
     _t("create_woff2", t)

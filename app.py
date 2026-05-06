@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import string
 
 import cv2
 import numpy as np
@@ -9,7 +10,8 @@ from PIL import Image as PILImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QScrollArea, QGridLayout,
-    QFrame, QMessageBox, QSizePolicy, QDialog, QLineEdit,
+    QFrame, QMessageBox, QSizePolicy, QDialog, QLineEdit, QComboBox,
+    QProgressBar,
 )
 from PyQt6.QtCore import Qt, QThread, QSize, pyqtSignal, QRect, QPoint, QByteArray
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QPen, QColor, QFont, QFontDatabase
@@ -32,8 +34,10 @@ TEXT    = "#f0f0f0"
 MUTED   = "#7a7a7a"
 ERROR   = "#e05a5a"
 
+EXPECTED_CHARS = list(string.ascii_lowercase + string.ascii_uppercase + string.digits + r""".,!?;:'"()-""")
+
 STYLESHEET = f"""
-QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; font-family: -apple-system, 'Segoe UI', sans-serif; }}
+QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; font-family: 'Helvetica Neue', 'Segoe UI', sans-serif; }}
 QScrollArea  {{ border: none; background: {BG}; }}
 QScrollBar:vertical {{
     background: {SURFACE}; width: 8px; border-radius: 4px;
@@ -72,33 +76,37 @@ def crop_to_pixmap(crop: np.ndarray, size: int) -> QPixmap:
 
 # ── worker thread ─────────────────────────────────────────────────────────────
 class Worker(QThread):
-    done  = pyqtSignal(object)  # emits (char_dict, box_dict, orig_img)
-    error = pyqtSignal(str)
+    done     = pyqtSignal(object, int)  # emits (char_dict, box_dict, orig_img), image_idx
+    progress = pyqtSignal(int, int)     # (completed, total)
+    error    = pyqtSignal(str)
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, image_idx: int = 0):
         super().__init__()
         self.path = path
+        self.image_idx = image_idx
 
     def run(self):
         try:
-            self.done.emit(build_char_dict(self.path))
+            self.done.emit(build_char_dict(self.path, self.progress.emit), self.image_idx)
         except Exception as e:
             self.error.emit(str(e))
 
 
 # ── preview worker ────────────────────────────────────────────────────────────
 class PreviewWorker(QThread):
-    done  = pyqtSignal(bytes, str)
+    done  = pyqtSignal(bytes, str, str)
     error = pyqtSignal(str)
 
-    def __init__(self, char: str, crop: np.ndarray):
+    def __init__(self, char: str, crop: np.ndarray, family_name: str):
         super().__init__()
         self.char = char
         self.crop = crop.copy()
+        self.family_name = family_name
 
     def run(self):
         try:
-            self.done.emit(generate_preview_ttf(self.char, self.crop), self.char)
+            ttf = generate_preview_ttf(self.char, self.crop, self.family_name)
+            self.done.emit(ttf, self.char, self.family_name)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -109,13 +117,12 @@ class CropEditorWidget(QWidget):
 
     HANDLE_SIZE = 10
 
-    def __init__(self, orig_img: np.ndarray, box: tuple, parent=None):
+    def __init__(self, orig_img: np.ndarray, box: tuple, parent=None, full_view: bool = False):
         super().__init__(parent)
         self._orig_img = orig_img
-        self._box = list(box)  # [x, y, w, h] — mutable during drag
+        self._box = list(box)
+        self._full_view = full_view
 
-        # Fixed view region: crop + generous padding. Stays constant so
-        # scale doesn't jump mid-drag when the box changes.
         self._view_rect = self._compute_view_rect()
         self._view_pixmap = self._build_view_pixmap()
 
@@ -126,9 +133,11 @@ class CropEditorWidget(QWidget):
         self.setMinimumSize(320, 260)
 
     def _compute_view_rect(self) -> tuple[int, int, int, int]:
+        img_h, img_w = self._orig_img.shape[:2]
+        if self._full_view:
+            return 0, 0, img_w, img_h
         x, y, w, h = self._box
         pad = max(80, max(w, h) // 2)
-        img_h, img_w = self._orig_img.shape[:2]
         vx  = max(0, x - pad)
         vy  = max(0, y - pad)
         vx2 = min(img_w, x + w + pad)
@@ -309,6 +318,105 @@ class CropEditorDialog(QDialog):
         self.accept()
 
 
+# ── draw-new-box dialog ───────────────────────────────────────────────────────
+class DrawBoxDialog(QDialog):
+    """Pick a region from any loaded source image to assign to a character."""
+
+    def __init__(
+        self,
+        source_images: list[np.ndarray],
+        source_names: list[str],
+        char: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f'Draw box — "{char}"')
+        self.setModal(True)
+        self.resize(720, 560)
+        self.setMinimumSize(560, 440)
+        self.setStyleSheet(STYLESHEET + f"QDialog {{ background: {SURFACE}; }}")
+
+        self._source_images = source_images
+        self._source_names  = source_names
+        self._char = char
+        self.new_box: tuple = (0, 0, 10, 10)
+        self.selected_image_idx: int = 0
+
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(16, 16, 16, 16)
+        self._outer.setSpacing(10)
+
+        # Image selector — only shown when multiple images are loaded
+        if len(source_images) > 1:
+            sel_row = QHBoxLayout()
+            sel_lbl = QLabel("Source image:")
+            sel_lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
+            sel_row.addWidget(sel_lbl)
+            self._img_combo = QComboBox()
+            self._img_combo.setStyleSheet(f"""
+                QComboBox {{
+                    background: {CARD}; color: {TEXT}; border: 1px solid {BORDER};
+                    border-radius: 6px; padding: 4px 10px; font-size: 13px;
+                }}
+                QComboBox::drop-down {{ border: none; }}
+                QComboBox QAbstractItemView {{
+                    background: {CARD}; color: {TEXT}; border: 1px solid {BORDER};
+                    selection-background-color: {ACCENT};
+                }}
+            """)
+            for name in source_names:
+                self._img_combo.addItem(name)
+            self._img_combo.currentIndexChanged.connect(self._on_image_changed)
+            sel_row.addWidget(self._img_combo, stretch=1)
+            self._outer.addLayout(sel_row)
+        else:
+            self._img_combo = None
+
+        self._editor_container = QVBoxLayout()
+        self._outer.addLayout(self._editor_container, stretch=1)
+        self._editor: CropEditorWidget | None = None
+        self._build_editor(0)
+
+        hint = QLabel(f'Drag the handles to frame the "{char}" character in the image')
+        hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self._outer.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        row.addWidget(cancel_btn)
+        apply_btn = QPushButton("Add")
+        apply_btn.setObjectName("browse")
+        apply_btn.setFixedHeight(34)
+        apply_btn.clicked.connect(self._apply)
+        row.addWidget(apply_btn)
+        self._outer.addLayout(row)
+
+    def _build_editor(self, image_idx: int):
+        if self._editor is not None:
+            self._editor_container.removeWidget(self._editor)
+            self._editor.deleteLater()
+
+        orig_img = self._source_images[image_idx]
+        img_h, img_w = orig_img.shape[:2]
+        size = max(40, min(img_w, img_h) // 6)
+        initial_box = (img_w // 2 - size // 2, img_h // 2 - size // 2, size, size)
+        self.new_box = initial_box
+        self.selected_image_idx = image_idx
+
+        self._editor = CropEditorWidget(orig_img, initial_box, self, full_view=True)
+        self._editor_container.addWidget(self._editor)
+
+    def _on_image_changed(self, idx: int):
+        self._build_editor(idx)
+
+    def _apply(self):
+        self.new_box = self._editor.get_box()
+        self.selected_image_idx = self._img_combo.currentIndex() if self._img_combo else 0
+        self.accept()
+
+
 # ── instance picker dialog ────────────────────────────────────────────────────
 class PickerDialog(QDialog):
     THUMB = 80
@@ -319,7 +427,8 @@ class PickerDialog(QDialog):
         char: str,
         crops: list[np.ndarray],
         boxes: list[tuple],
-        orig_img: np.ndarray | None,
+        source_images: list[np.ndarray],
+        box_sources: list[int],
         current: int,
         parent=None,
     ):
@@ -329,25 +438,43 @@ class PickerDialog(QDialog):
         self.setMinimumWidth(420)
         self.setStyleSheet(STYLESHEET + f"QDialog {{ background: {SURFACE}; }}")
 
-        self._char    = char
-        self._crops   = [c.copy() for c in crops]
-        self._boxes   = list(boxes)
-        self._orig_img = orig_img
-        self.chosen   = current
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            self.setMaximumHeight(int(screen.availableGeometry().height() * 0.9))
+
+        self._char          = char
+        self._crops         = [c.copy() for c in crops]
+        self._boxes         = list(boxes)
+        self._source_images = source_images
+        self._box_sources   = list(box_sources)  # parallel to _crops/_boxes
+        self._selected_indices: set[int] = {current} if 0 <= current < len(self._crops) else (set() if not self._crops else {0})
         self._pending_reassignments: list[tuple] = []
         self._preview_worker: PreviewWorker | None = None
-        self._preview_font_id = -1
+        self._preview_counter = 0
 
-        outer = QVBoxLayout(self)
+        dlg_layout = QVBoxLayout(self)
+        dlg_layout.setContentsMargins(0, 0, 0, 0)
+        dlg_layout.setSpacing(0)
+        outer_scroll = QScrollArea()
+        outer_scroll.setWidgetResizable(True)
+        outer_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        outer_scroll.setWidget(content)
+        dlg_layout.addWidget(outer_scroll)
+
+        outer = QVBoxLayout(content)
         outer.setContentsMargins(20, 20, 20, 20)
         outer.setSpacing(12)
 
-        # ── instance count ──
         self._count_lbl = QLabel()
         self._count_lbl.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
         outer.addWidget(self._count_lbl)
 
-        # ── scrollable instance grid ──
+        self._multi_hint = QLabel("Cmd/Ctrl-click to select multiple instances")
+        self._multi_hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        outer.addWidget(self._multi_hint)
+
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._inner  = QWidget()
@@ -360,17 +487,14 @@ class PickerDialog(QDialog):
         self._btns: list[QPushButton] = []
         self._rebuild_thumbnails()
 
-        # ── edit crop ──
         self._edit_crop_btn = QPushButton("Edit Crop")
         self._edit_crop_btn.setObjectName("browse")
         self._edit_crop_btn.setFixedHeight(34)
-        self._edit_crop_btn.setEnabled(orig_img is not None and bool(self._boxes))
         self._edit_crop_btn.clicked.connect(self._do_edit_crop)
         outer.addWidget(self._edit_crop_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
         outer.addWidget(self._divider())
 
-        # ── reassign ──
         reassign_lbl = QLabel("Reassign selected instance to character:")
         reassign_lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
         outer.addWidget(reassign_lbl)
@@ -401,7 +525,6 @@ class PickerDialog(QDialog):
 
         outer.addWidget(self._divider())
 
-        # ── font preview ──
         preview_hdr = QLabel("Font preview:")
         preview_hdr.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
         outer.addWidget(preview_hdr)
@@ -424,17 +547,16 @@ class PickerDialog(QDialog):
         self._preview_status.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         self._preview_status.setWordWrap(True)
         preview_ctrl.addWidget(self._preview_status)
-        gen_btn = QPushButton("Generate Preview")
-        gen_btn.setFixedHeight(34)
-        gen_btn.clicked.connect(self._do_generate_preview)
-        preview_ctrl.addWidget(gen_btn)
+        self._gen_btn = QPushButton("Generate Preview")
+        self._gen_btn.setFixedHeight(34)
+        self._gen_btn.clicked.connect(self._do_generate_preview)
+        preview_ctrl.addWidget(self._gen_btn)
         preview_ctrl.addStretch()
         preview_row.addLayout(preview_ctrl)
         outer.addLayout(preview_row)
 
         outer.addWidget(self._divider())
 
-        # ── bottom buttons ──
         btn_row = QHBoxLayout()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
@@ -446,6 +568,8 @@ class PickerDialog(QDialog):
         done_btn.clicked.connect(self.accept)
         btn_row.addWidget(done_btn)
         outer.addLayout(btn_row)
+
+        self._refresh_action_buttons()
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _divider(self) -> QFrame:
@@ -469,8 +593,9 @@ class PickerDialog(QDialog):
             btn.setIcon(QIcon(crop_to_pixmap(crop, self.THUMB)))
             btn.setIconSize(QSize(self.THUMB, self.THUMB))
             btn.setCheckable(True)
-            btn.setChecked(i == self.chosen)
-            btn.setStyleSheet(self._btn_style(i == self.chosen))
+            sel = i in self._selected_indices
+            btn.setChecked(sel)
+            btn.setStyleSheet(self._btn_style(sel))
             btn.clicked.connect(lambda _, idx=i: self._pick(idx))
             self._grid.addWidget(btn, i // self.COLS, i % self.COLS)
             self._btns.append(btn)
@@ -479,6 +604,23 @@ class PickerDialog(QDialog):
         self._count_lbl.setText(f"{n} instance(s) — click one to select")
         rows = max(1, min((n + self.COLS - 1) // self.COLS, 4))
         self._scroll.setFixedHeight(rows * (self.THUMB + 40) + 20)
+        self._refresh_action_buttons()
+
+    @property
+    def chosen(self) -> int:
+        if not self._selected_indices:
+            return 0
+        return min(self._selected_indices)
+
+    def _refresh_action_buttons(self):
+        if not hasattr(self, "_edit_crop_btn"):
+            return
+        n_sel = len(self._selected_indices)
+        single = n_sel == 1 and bool(self._crops)
+        self._edit_crop_btn.setEnabled(single and bool(self._source_images) and bool(self._boxes))
+        self._gen_btn.setEnabled(single)
+        if n_sel > 1:
+            self._preview_status.setText("Select a single instance to preview")
 
     def _btn_style(self, selected: bool) -> str:
         border = SEL_B if selected else BORDER
@@ -492,76 +634,96 @@ class PickerDialog(QDialog):
 
     # ── actions ───────────────────────────────────────────────────────────────
     def _pick(self, idx: int):
-        self.chosen = idx
+        mods = QApplication.keyboardModifiers()
+        multi = bool(mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
+        if multi:
+            if idx in self._selected_indices:
+                if len(self._selected_indices) > 1:
+                    self._selected_indices.discard(idx)
+            else:
+                self._selected_indices.add(idx)
+        else:
+            self._selected_indices = {idx}
         for i, btn in enumerate(self._btns):
-            btn.setStyleSheet(self._btn_style(i == idx))
-            btn.setChecked(i == idx)
+            sel = i in self._selected_indices
+            btn.setStyleSheet(self._btn_style(sel))
+            btn.setChecked(sel)
+        self._refresh_action_buttons()
 
     def _do_reassign(self):
         target = self._char_input.text().strip()
-        if not target or not self._crops:
+        if not target or not self._crops or not self._selected_indices:
             return
-        idx  = self.chosen
-        crop = self._crops.pop(idx)
-        box  = self._boxes.pop(idx) if idx < len(self._boxes) else (0, 0, crop.shape[1], crop.shape[0])
-        self._pending_reassignments.append((crop, box, target))
-        self.chosen = max(0, min(idx, len(self._crops) - 1))
+        for idx in sorted(self._selected_indices, reverse=True):
+            crop    = self._crops.pop(idx)
+            box     = self._boxes.pop(idx) if idx < len(self._boxes) else (0, 0, crop.shape[1], crop.shape[0])
+            src_idx = self._box_sources.pop(idx) if idx < len(self._box_sources) else 0
+            self._pending_reassignments.append((crop, box, src_idx, target))
+        self._selected_indices = {0} if self._crops else set()
         self._char_input.clear()
-        chars = [r[2] for r in self._pending_reassignments]
+        chars = [r[3] for r in self._pending_reassignments]
         self._reassign_status.setText("Pending: " + ", ".join(f"→ '{c}'" for c in chars))
         self._rebuild_thumbnails()
 
     def _do_edit_crop(self):
-        if self._orig_img is None or self.chosen >= len(self._boxes):
+        if len(self._selected_indices) != 1:
             return
-        dlg = CropEditorDialog(self._orig_img, self._boxes[self.chosen], self._char, self)
+        idx = next(iter(self._selected_indices))
+        if idx >= len(self._boxes):
+            return
+        src_idx  = self._box_sources[idx] if idx < len(self._box_sources) else 0
+        orig_img = self._source_images[src_idx] if src_idx < len(self._source_images) else None
+        if orig_img is None:
+            return
+        dlg = CropEditorDialog(orig_img, self._boxes[idx], self._char, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_box = dlg.new_box
-        self._boxes[self.chosen] = new_box
+        self._boxes[idx] = new_box
         x, y, w, h = new_box
-        img_h, img_w = self._orig_img.shape[:2]
-        new_crop = self._orig_img[
+        img_h, img_w = orig_img.shape[:2]
+        new_crop = orig_img[
             max(0, y) : min(img_h, y + h),
             max(0, x) : min(img_w, x + w),
         ].copy()
-        self._crops[self.chosen] = new_crop
-        self._btns[self.chosen].setIcon(QIcon(crop_to_pixmap(new_crop, self.THUMB)))
+        self._crops[idx] = new_crop
+        self._btns[idx].setIcon(QIcon(crop_to_pixmap(new_crop, self.THUMB)))
 
     def _do_generate_preview(self):
         if self._preview_worker and self._preview_worker.isRunning():
             return
-        if not self._crops:
+        if len(self._selected_indices) != 1 or not self._crops:
             return
+        idx = next(iter(self._selected_indices))
+        self._preview_counter += 1
+        family = f"FontBuilderPreview_{id(self):x}_{self._preview_counter}"
         self._preview_status.setText("Generating…")
-        self._preview_worker = PreviewWorker(self._char, self._crops[self.chosen])
+        self._preview_worker = PreviewWorker(self._char, self._crops[idx], family)
         self._preview_worker.done.connect(self._on_preview_done)
         self._preview_worker.error.connect(
             lambda e: self._preview_status.setText(f"Error: {e}")
         )
         self._preview_worker.start()
 
-    def _on_preview_done(self, ttf_bytes: bytes, char: str):
-        if self._preview_font_id >= 0:
-            QFontDatabase.removeApplicationFont(self._preview_font_id)
+    def _on_preview_done(self, ttf_bytes: bytes, char: str, family_name: str):
         font_data = QByteArray(ttf_bytes)
-        self._preview_font_id = QFontDatabase.addApplicationFontFromData(font_data)
-        if self._preview_font_id < 0:
+        font_id = QFontDatabase.addApplicationFontFromData(font_data)
+        if font_id < 0:
             self._preview_status.setText("Could not load preview font")
             return
-        families = QFontDatabase.applicationFontFamilies(self._preview_font_id)
-        if families:
-            self._preview_lbl.setStyleSheet(f"""
-                QLabel {{
-                    background: white; color: black;
-                    border: 1px solid {BORDER}; border-radius: 6px;
-                    font-family: "{families[0]}"; font-size: 72pt;
-                }}
-            """)
-            self._preview_lbl.setText(char)
-            self._preview_status.setText("Preview ready")
-        else:
+        families = QFontDatabase.applicationFontFamilies(font_id)
+        if not families:
             self._preview_status.setText("Font loaded but no families found")
+            return
+        self._preview_lbl.setStyleSheet(f"""
+            QLabel {{
+                background: white; color: black;
+                border: 1px solid {BORDER}; border-radius: 6px;
+                font-family: "{families[0]}"; font-size: 72pt;
+            }}
+        """)
+        self._preview_lbl.setText(char)
+        self._preview_status.setText("Preview ready")
 
     # ── result accessors ──────────────────────────────────────────────────────
     def get_updated_crops(self) -> list[np.ndarray]:
@@ -570,7 +732,11 @@ class PickerDialog(QDialog):
     def get_updated_boxes(self) -> list[tuple]:
         return self._boxes
 
+    def get_updated_box_sources(self) -> list[int]:
+        return self._box_sources
+
     def get_pending_reassignments(self) -> list[tuple]:
+        # Each entry: (crop, box, source_image_idx, target_char)
         return self._pending_reassignments
 
 
@@ -630,6 +796,50 @@ class CharCard(QFrame):
             self.clicked.emit(self.char)
 
 
+# ── placeholder card (missing character) ──────────────────────────────────────
+class PlaceholderCard(QFrame):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, char: str, parent=None):
+        super().__init__(parent)
+        self.char = char
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setFixedSize(108, 136)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: transparent;
+                border: 1px dashed {BORDER};
+                border-radius: 10px;
+            }}
+            QFrame:hover {{ border-color: {ACCENT}; }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 8)
+        layout.setSpacing(3)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        plus = QLabel("+")
+        plus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        plus.setStyleSheet(f"color: {MUTED}; font-size: 32px; background: transparent; border: none;")
+        layout.addWidget(plus)
+
+        char_lbl = QLabel(char)
+        char_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        char_lbl.setStyleSheet(f"color: {MUTED}; font-size: 18px; font-weight: 600; background: transparent; border: none;")
+        layout.addWidget(char_lbl)
+
+        cp_lbl = QLabel(f"U+{ord(char):04X}")
+        cp_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cp_lbl.setStyleSheet(f"color: {MUTED}; font-size: 10px; background: transparent; border: none;")
+        layout.addWidget(cp_lbl)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.char)
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     COLS = 6
@@ -641,11 +851,13 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(520, 400)
         self.setStyleSheet(STYLESHEET)
 
-        self._all_crops:      dict[str, list[np.ndarray]] = {}
-        self._all_boxes:      dict[str, list[tuple]]      = {}
-        self._original_image: np.ndarray | None           = None
-        self._selected:       dict[str, int]              = {}
-        self._cards:          dict[str, CharCard]         = {}
+        self._all_crops:     dict[str, list[np.ndarray]] = {}
+        self._all_boxes:     dict[str, list[tuple]]      = {}
+        self._box_sources:   dict[str, list[int]]        = {}  # image_idx per crop, parallel to _all_boxes
+        self._source_images: list[np.ndarray]            = []
+        self._source_names:  list[str]                   = []
+        self._selected:      dict[str, int]              = {}
+        self._cards:         dict[str, CharCard]         = {}
         self._worker: Worker | None = None
 
         self._build_ui()
@@ -671,9 +883,37 @@ class MainWindow(QMainWindow):
         browse_btn.clicked.connect(self._browse)
         hbox.addWidget(browse_btn)
 
+        self._add_btn = QPushButton("Add image…")
+        self._add_btn.setFixedHeight(34)
+        self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._add_btn.setEnabled(False)
+        self._add_btn.clicked.connect(self._add_image)
+        hbox.addWidget(self._add_btn)
+
         self._status = QLabel("No file selected")
         self._status.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
         hbox.addWidget(self._status, stretch=1)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setFixedWidth(160)
+        self._progress_bar.setFixedHeight(10)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: {CARD}; border: 1px solid {BORDER};
+                border-radius: 5px;
+            }}
+            QProgressBar::chunk {{
+                background: {ACCENT}; border-radius: 4px;
+            }}
+        """)
+        self._progress_bar.setVisible(False)
+        hbox.addWidget(self._progress_bar)
+
+        self._progress_count = QLabel()
+        self._progress_count.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        self._progress_count.setVisible(False)
+        hbox.addWidget(self._progress_count)
 
         self._save_btn = QPushButton("Save font…")
         self._save_btn.setObjectName("save")
@@ -705,6 +945,10 @@ class MainWindow(QMainWindow):
         vbox.addWidget(scroll, stretch=1)
 
     # ── pipeline ──────────────────────────────────────────────────────────────
+    def _set_busy(self, busy: bool):
+        self._add_btn.setEnabled(not busy and bool(self._source_images))
+        self._save_btn.setEnabled(not busy and bool(self._all_crops))
+
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open image",
@@ -712,28 +956,87 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        # Clear all state for a fresh project
+        self._source_images.clear()
+        self._source_names.clear()
+        self._all_crops.clear()
+        self._all_boxes.clear()
+        self._box_sources.clear()
+        self._selected.clear()
+        self._source_names.append(os.path.basename(path))
+
+        self._status.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
         self._status.setText(f"Processing {os.path.basename(path)}…")
-        self._save_btn.setEnabled(False)
+        self._set_busy(True)
         self._clear_grid()
 
-        self._worker = Worker(path)
+        self._worker = Worker(path, image_idx=0)
         self._worker.done.connect(self._on_done)
         self._worker.error.connect(self._on_error)
+        self._worker.progress.connect(self._on_progress)
         self._worker.start()
 
-    def _on_done(self, result):
+    def _add_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Add image",
+            filter="Images (*.png *.jpg *.jpeg *.bmp *.tiff);;All files (*.*)",
+        )
+        if not path:
+            return
+        name = os.path.basename(path)
+        image_idx = len(self._source_images)
+        self._source_names.append(name)
+
+        self._status.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
+        self._status.setText(f"Processing {name}…")
+        self._set_busy(True)
+
+        self._worker = Worker(path, image_idx=image_idx)
+        self._worker.done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.start()
+
+    def _on_progress(self, completed: int, total: int):
+        if completed == 0:
+            self._progress_bar.setMaximum(total)
+            self._progress_bar.setValue(0)
+            self._progress_bar.setVisible(True)
+            self._progress_count.setVisible(True)
+            self._status.setText(f"Classifying {total} crops…")
+        self._progress_bar.setValue(completed)
+        self._progress_count.setText(f"{completed} / {total}")
+
+    def _on_done(self, result, image_idx: int):
         char_dict, box_dict, orig_img = result
-        self._all_crops      = char_dict
-        self._all_boxes      = box_dict
-        self._original_image = orig_img
-        self._selected       = {char: 0 for char in char_dict}
-        self._status.setText(f"{len(char_dict)} character(s) found — click any to edit")
-        self._save_btn.setEnabled(True)
+
+        while len(self._source_images) <= image_idx:
+            self._source_images.append(None)
+        self._source_images[image_idx] = orig_img
+
+        for char, crops in char_dict.items():
+            boxes = box_dict.get(char, [])
+            self._all_crops.setdefault(char, []).extend(crops)
+            self._all_boxes.setdefault(char, []).extend(boxes)
+            self._box_sources.setdefault(char, []).extend([image_idx] * len(crops))
+            self._selected.setdefault(char, 0)
+
+        self._progress_bar.setVisible(False)
+        self._progress_count.setVisible(False)
+
+        n_imgs  = len([i for i in self._source_images if i is not None])
+        n_chars = len(self._all_crops)
+        img_label = "image" if n_imgs == 1 else "images"
+        self._status.setText(f"{n_chars} character(s) from {n_imgs} {img_label} — click any to edit")
+        self._set_busy(False)
         self._populate_grid()
 
     def _on_error(self, msg: str):
+        self._progress_bar.setVisible(False)
+        self._progress_count.setVisible(False)
         self._status.setStyleSheet(f"color: {ERROR}; font-size: 13px;")
         self._status.setText(f"Error: {msg}")
+        self._set_busy(False)
         QMessageBox.critical(self, "Processing failed", msg)
 
     # ── grid ──────────────────────────────────────────────────────────────────
@@ -746,17 +1049,27 @@ class MainWindow(QMainWindow):
 
     def _populate_grid(self):
         self._clear_grid()
+        if not self._source_images:
+            return
         cols = max(1, (self.width() - 60) // 118)
-        for i, char in enumerate(sorted(self._all_crops)):
-            crops = self._all_crops[char]
-            card  = CharCard(char, crops[self._selected[char]], len(crops))
-            card.clicked.connect(self._on_card_clicked)
+        extras = sorted(c for c in self._all_crops if c not in EXPECTED_CHARS)
+        ordered = EXPECTED_CHARS + extras
+        for i, char in enumerate(ordered):
+            if char in self._all_crops:
+                crops = self._all_crops[char]
+                idx   = self._selected.get(char, 0)
+                idx   = min(idx, len(crops) - 1)
+                card  = CharCard(char, crops[idx], len(crops))
+                card.clicked.connect(self._on_card_clicked)
+            else:
+                card = PlaceholderCard(char)
+                card.clicked.connect(self._on_placeholder_clicked)
             self._grid_layout.addWidget(card, i // cols, i % cols)
             self._cards[char] = card
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._all_crops:
+        if self._source_images:
             self._populate_grid()
 
     # ── picker ────────────────────────────────────────────────────────────────
@@ -765,31 +1078,54 @@ class MainWindow(QMainWindow):
             char,
             self._all_crops[char],
             self._all_boxes.get(char, []),
-            self._original_image,
-            self._selected[char],
+            self._source_images,
+            self._box_sources.get(char, []),
+            self._selected.get(char, 0),
             self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Apply crop/box edits for this character
-        self._all_crops[char] = dlg.get_updated_crops()
-        self._all_boxes[char] = dlg.get_updated_boxes()
+        self._all_crops[char]   = dlg.get_updated_crops()
+        self._all_boxes[char]   = dlg.get_updated_boxes()
+        self._box_sources[char] = dlg.get_updated_box_sources()
 
-        # Apply pending reassignments
-        for reassign_crop, reassign_box, to_char in dlg.get_pending_reassignments():
+        for reassign_crop, reassign_box, src_idx, to_char in dlg.get_pending_reassignments():
             self._all_crops.setdefault(to_char, []).append(reassign_crop)
             self._all_boxes.setdefault(to_char, []).append(reassign_box)
+            self._box_sources.setdefault(to_char, []).append(src_idx)
             self._selected.setdefault(to_char, len(self._all_crops[to_char]) - 1)
 
-        # Update or remove this character
         if self._all_crops.get(char):
             self._selected[char] = min(dlg.chosen, len(self._all_crops[char]) - 1)
         else:
             self._all_crops.pop(char, None)
             self._all_boxes.pop(char, None)
+            self._box_sources.pop(char, None)
             self._selected.pop(char, None)
 
+        self._populate_grid()
+
+    def _on_placeholder_clicked(self, char: str):
+        if not self._source_images:
+            return
+        dlg = DrawBoxDialog(self._source_images, self._source_names, char, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        x, y, w, h = dlg.new_box
+        image_idx  = dlg.selected_image_idx
+        orig_img   = self._source_images[image_idx]
+        img_h, img_w = orig_img.shape[:2]
+        crop = orig_img[
+            max(0, y) : min(img_h, y + h),
+            max(0, x) : min(img_w, x + w),
+        ].copy()
+        if crop.size == 0:
+            return
+        self._all_crops.setdefault(char, []).append(crop)
+        self._all_boxes.setdefault(char, []).append((x, y, w, h))
+        self._box_sources.setdefault(char, []).append(image_idx)
+        self._selected[char] = len(self._all_crops[char]) - 1
         self._populate_grid()
 
     # ── save ──────────────────────────────────────────────────────────────────

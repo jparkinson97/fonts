@@ -14,6 +14,7 @@ UPM = 1000
 GLYPH_HEIGHT = 800
 CU2QU_MAX_ERR = 1.0
 OVERSAMPLE = 4  # upscale the crop before vtracer so sub-pixel detail (terminals, varying stroke width) survives
+_NORM_MARGIN = 0.12  # whitespace added around tight ink bbox, as fraction of the larger ink dimension
 
 ASCENDER = GLYPH_HEIGHT
 DESCENDER = GLYPH_HEIGHT - UPM
@@ -27,6 +28,21 @@ VTRACER_PARAMS = dict(
     splice_threshold = 45,   # curve-fitting aggressiveness
     path_precision   = 3,    # decimal places in SVG output
 )
+
+
+def _normalize_ink(img: np.ndarray) -> np.ndarray:
+    """Trim to tight ink bounding box then pad uniformly so every glyph fills the same proportion."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        return img
+    x, y, w, h = cv2.boundingRect(coords)
+    pad = max(2, int(max(w, h) * _NORM_MARGIN))
+    ih, iw = img.shape[:2]
+    x1 = max(0, x - pad);  y1 = max(0, y - pad)
+    x2 = min(iw, x + w + pad); y2 = min(ih, y + h + pad)
+    return img[y1:y2, x1:x2]
 
 
 def _svg_to_pen(svg: str, pen, img_h: int, img_w: int):
@@ -63,6 +79,7 @@ def _svg_to_pen(svg: str, pen, img_h: int, img_w: int):
 
 
 def ndarray_to_glyph(image: np.ndarray):
+    image    = _normalize_ink(image)
     gray     = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
 
@@ -142,7 +159,7 @@ def create_woff2(char_arrays: dict[str, np.ndarray], output_path: str, font_name
     return font
 
 
-def generate_preview_ttf(char: str, crop: np.ndarray) -> bytes:
+def generate_preview_ttf(char: str, crop: np.ndarray, family_name: str = "FontBuilderPreview") -> bytes:
     """Generate an in-memory TTF for a single character, for Qt preview use."""
     name = _glyph_name(char)
     glyph, advance_width = ndarray_to_glyph(crop)
@@ -153,7 +170,7 @@ def generate_preview_ttf(char: str, crop: np.ndarray) -> bytes:
     fb.setupGlyf({".notdef": EmptyGlyph(), name: glyph})
     fb.setupHorizontalMetrics({".notdef": (UPM // 2, 0), name: (advance_width, 0)})
     fb.setupHorizontalHeader(ascent=ASCENDER, descent=DESCENDER)
-    fb.setupNameTable({"familyName": "FontBuilderPreview", "styleName": "Regular"})
+    fb.setupNameTable({"familyName": family_name, "styleName": "Regular"})
     fb.setupOS2(
         sTypoAscender=ASCENDER,
         sTypoDescender=DESCENDER,

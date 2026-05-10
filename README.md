@@ -18,5 +18,6 @@ Be sure to click on each and ensure the cropping is good and nothing is incorrec
 Optionally upload more images to fill in any missing characters.
 Optionally turn on 'Super Resolution' In options to average the first 10 images of a character.
 
-Click save and enjoy the font!. 
+
+Click save and [enjoy](https://fontsee.com/) the font!. 
 

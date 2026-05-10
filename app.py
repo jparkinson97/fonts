@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QScrollArea, QGridLayout,
     QFrame, QMessageBox, QSizePolicy, QDialog, QLineEdit, QComboBox,
-    QProgressBar,
+    QProgressBar, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QThread, QSize, pyqtSignal, QRect, QPoint, QByteArray
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QPen, QColor, QFont, QFontDatabase
@@ -97,15 +97,23 @@ class PreviewWorker(QThread):
     done  = pyqtSignal(bytes, str, str)
     error = pyqtSignal(str)
 
-    def __init__(self, char: str, crop: np.ndarray, family_name: str):
+    def __init__(self, char: str, crops, family_name: str, super_resolution: bool = False):
         super().__init__()
         self.char = char
-        self.crop = crop.copy()
+        # Accept a single crop or a list of crops.
+        if isinstance(crops, list):
+            self.crops = [c.copy() for c in crops]
+        else:
+            self.crops = [crops.copy()]
         self.family_name = family_name
+        self.super_resolution = super_resolution
 
     def run(self):
         try:
-            ttf = generate_preview_ttf(self.char, self.crop, self.family_name)
+            ttf = generate_preview_ttf(
+                self.char, self.crops, self.family_name,
+                super_resolution=self.super_resolution,
+            )
             self.done.emit(ttf, self.char, self.family_name)
         except Exception as e:
             self.error.emit(str(e))
@@ -116,14 +124,13 @@ class PixelEditor(QFrame):
     """Click/drag to toggle pixels between black and white."""
 
     changed = pyqtSignal()
-    TARGET = 280  # max px on the longest side of the displayed grid
 
-    def __init__(self, binary: np.ndarray, parent=None):
+    def __init__(self, binary: np.ndarray, parent=None, target_size: int = 280):
         super().__init__(parent)
         self.setStyleSheet(f"background: white; border: 1px solid {BORDER}; border-radius: 6px;")
         self._bin = binary.copy().astype(np.uint8)
         h, w = self._bin.shape
-        self._cell = max(2, self.TARGET // max(h, w))
+        self._cell = max(2, target_size // max(h, w))
         self.setFixedSize(w * self._cell + 2, h * self._cell + 2)
         self._drag_value: int | None = None
         self._last_cell: tuple | None = None
@@ -498,6 +505,7 @@ class PickerDialog(QDialog):
         box_sources: list[int],
         current: int,
         parent=None,
+        super_resolution: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle(f'Edit  "{char}"')
@@ -520,6 +528,7 @@ class PickerDialog(QDialog):
         self._preview_counter = 0
         self._pixel_editor: PixelEditor | None = None
         self._pixel_editor_idx: int | None = None
+        self._super_resolution = super_resolution
 
         dlg_layout = QVBoxLayout(self)
         dlg_layout.setContentsMargins(0, 0, 0, 0)
@@ -599,11 +608,12 @@ class PickerDialog(QDialog):
         outer.addWidget(preview_hdr)
 
         preview_row = QHBoxLayout()
-        self._pixel_editor_holder = QHBoxLayout()
-        preview_row.addLayout(self._pixel_editor_holder)
+        self.PREVIEW_SIZE = 240
         self._preview_lbl = QLabel(char)
         self._preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview_lbl.setFixedSize(120, 120)
+        self._preview_lbl.setFixedSize(self.PREVIEW_SIZE, self.PREVIEW_SIZE)
+        self._preview_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._preview_lbl.setToolTip("Click to edit pixels")
         self._preview_lbl.setStyleSheet(f"""
             QLabel {{
                 background: white; color: black;
@@ -611,7 +621,11 @@ class PickerDialog(QDialog):
                 font-size: 13px;
             }}
         """)
+        self._preview_lbl.mousePressEvent = lambda _ev: self._show_pixel_editor()
+        self._pixel_editor_holder = QHBoxLayout()
+        self._pixel_editor_holder.setContentsMargins(0, 0, 0, 0)
         preview_row.addWidget(self._preview_lbl)
+        preview_row.addLayout(self._pixel_editor_holder)
 
         preview_ctrl = QVBoxLayout()
         self._preview_status = QLabel("Click Generate to preview")
@@ -780,10 +794,19 @@ class PickerDialog(QDialog):
         pad = max(8, int(max(h, w) * 0.25))
         binary = cv2.copyMakeBorder(binary, pad, pad, pad, pad,
                                     cv2.BORDER_CONSTANT, value=255)
-        self._pixel_editor = PixelEditor(binary, self)
+        self._pixel_editor = PixelEditor(binary, self, target_size=self.PREVIEW_SIZE)
         self._pixel_editor_idx = idx
         self._pixel_editor.changed.connect(self._on_pixel_edit)
         self._pixel_editor_holder.addWidget(self._pixel_editor)
+
+    def _show_pixel_editor(self):
+        """Click on preview → swap it for the pixel editor."""
+        if len(self._selected_indices) != 1 or not self._crops:
+            return
+        idx = next(iter(self._selected_indices))
+        self._ensure_pixel_editor(idx)
+        self._preview_lbl.hide()
+        self._preview_status.setText("Edit pixels, then click Generate Preview")
 
     def _on_pixel_edit(self):
         if self._pixel_editor is None or self._pixel_editor_idx is None:
@@ -801,11 +824,21 @@ class PickerDialog(QDialog):
         if len(self._selected_indices) != 1 or not self._crops:
             return
         idx = next(iter(self._selected_indices))
-        self._ensure_pixel_editor(idx)
+        # Generating switches back from editor (if open) to the preview view.
+        self._clear_pixel_editor()
+        self._preview_lbl.show()
         self._preview_counter += 1
         family = f"FontBuilderPreview_{id(self):x}_{self._preview_counter}"
-        self._preview_status.setText("Generating…")
-        self._preview_worker = PreviewWorker(self._char, self._crops[idx], family)
+        if self._super_resolution and len(self._crops) > 1:
+            self._preview_status.setText(f"Generating… (merging {min(len(self._crops), 10)} samples)")
+            preview_input = self._crops
+        else:
+            self._preview_status.setText("Generating…")
+            preview_input = self._crops[idx]
+        self._preview_worker = PreviewWorker(
+            self._char, preview_input, family,
+            super_resolution=self._super_resolution,
+        )
         self._preview_worker.done.connect(self._on_preview_done)
         self._preview_worker.error.connect(
             lambda e: self._preview_status.setText(f"Error: {e}")
@@ -826,7 +859,7 @@ class PickerDialog(QDialog):
             QLabel {{
                 background: white; color: black;
                 border: 1px solid {BORDER}; border-radius: 6px;
-                font-family: "{families[0]}"; font-size: 72pt;
+                font-family: "{families[0]}"; font-size: 140pt;
             }}
         """)
         self._preview_lbl.setText(char)
@@ -850,11 +883,13 @@ class PickerDialog(QDialog):
 # ── character card ────────────────────────────────────────────────────────────
 class CharCard(QFrame):
     clicked = pyqtSignal(str)
+    right_clicked = pyqtSignal(str)
     THUMB = 72
 
-    def __init__(self, char: str, crop: np.ndarray, count: int, parent=None):
+    def __init__(self, char: str, crop: np.ndarray, count: int, parent=None, locked: bool = False):
         super().__init__(parent)
         self.char = char
+        self._locked = locked
         self._apply_style(selected=False)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setFixedSize(108, 136)
@@ -901,6 +936,38 @@ class CharCard(QFrame):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.char)
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.right_clicked.emit(self.char)
+
+    def setLocked(self, locked: bool):
+        if self._locked == locked:
+            return
+        self._locked = locked
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._locked:
+            return
+        # Green check badge top-right.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = 14
+        cx = self.width() - r - 6
+        cy = r + 6
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#22c55e"))
+        painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        pen = QPen(QColor("white"))
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline(
+            QPoint(cx - 5, cy),
+            QPoint(cx - 1, cy + 4),
+            QPoint(cx + 6, cy - 4),
+        )
 
 
 # ── placeholder card (missing character) ──────────────────────────────────────
@@ -964,6 +1031,7 @@ class MainWindow(QMainWindow):
         self._source_images: list[np.ndarray]            = []
         self._source_names:  list[str]                   = []
         self._selected:      dict[str, int]              = {}
+        self._locked:        set[str]                    = set()
         self._cards:         dict[str, CharCard]         = {}
         self._worker: Worker | None = None
 
@@ -1022,7 +1090,14 @@ class MainWindow(QMainWindow):
         self._progress_count.setVisible(False)
         hbox.addWidget(self._progress_count)
 
-        self._save_btn = QPushButton("Save font…")
+        self._preview_btn = QPushButton("Preview")
+        self._preview_btn.setFixedHeight(34)
+        self._preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.clicked.connect(self._show_font_preview)
+        hbox.addWidget(self._preview_btn)
+
+        self._save_btn = QPushButton("Save")
         self._save_btn.setObjectName("save")
         self._save_btn.setFixedHeight(34)
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1030,7 +1105,24 @@ class MainWindow(QMainWindow):
         self._save_btn.clicked.connect(self._save)
         hbox.addWidget(self._save_btn)
 
+        self._settings_btn = QPushButton("☰")
+        self._settings_btn.setFixedSize(34, 34)
+        self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._settings_btn.setCheckable(True)
+        self._settings_btn.setToolTip("Options")
+        font = self._settings_btn.font()
+        font.setPixelSize(18)
+        self._settings_btn.setFont(font)
+        self._settings_btn.clicked.connect(self._toggle_settings_panel)
+        hbox.addWidget(self._settings_btn)
+
         vbox.addWidget(toolbar)
+
+        # Main row: scrollable grid on the left, collapsible settings panel
+        # on the right.
+        main_row = QHBoxLayout()
+        main_row.setContentsMargins(0, 0, 0, 0)
+        main_row.setSpacing(0)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1049,12 +1141,49 @@ class MainWindow(QMainWindow):
         self._grid_layout.addWidget(self._empty_label, 0, 0, 1, 6)
 
         scroll.setWidget(self._grid_widget)
-        vbox.addWidget(scroll, stretch=1)
+        main_row.addWidget(scroll, stretch=1)
+        main_row.addWidget(self._build_settings_panel())
+
+        vbox.addLayout(main_row, stretch=1)
+
+    # ── settings panel ────────────────────────────────────────────────────────
+    def _build_settings_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("settings_panel")
+        panel.setFixedWidth(240)
+        panel.setStyleSheet(
+            f"#settings_panel {{ background: {SURFACE}; border-left: 1px solid {BORDER}; }}"
+            f" QLabel {{ color: {TEXT}; }}"
+            f" QCheckBox {{ color: {TEXT}; font-size: 13px; }}"
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Settings")
+        title.setStyleSheet(f"color: {TEXT}; font-size: 14px; font-weight: 600;")
+        layout.addWidget(title)
+
+        self._sr_checkbox = QCheckBox("Super resolution")
+        self._sr_checkbox.setToolTip(
+            "Align and median-stack up to 10 samples per character "
+            "to recover sub-pixel detail. Slower but sharper."
+        )
+        layout.addWidget(self._sr_checkbox)
+
+        layout.addStretch(1)
+        panel.setVisible(False)
+        self._settings_panel = panel
+        return panel
+
+    def _toggle_settings_panel(self):
+        self._settings_panel.setVisible(self._settings_btn.isChecked())
 
     # ── pipeline ──────────────────────────────────────────────────────────────
     def _set_busy(self, busy: bool):
         self._add_btn.setEnabled(not busy and bool(self._source_images))
         self._save_btn.setEnabled(not busy and bool(self._all_crops))
+        self._preview_btn.setEnabled(not busy and bool(self._all_crops))
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1122,6 +1251,10 @@ class MainWindow(QMainWindow):
         self._source_images[image_idx] = orig_img
 
         for char, crops in char_dict.items():
+            # Locked characters are considered finished — skip new samples for
+            # them so adding more images doesn't reopen review work.
+            if char in self._locked:
+                continue
             boxes = box_dict.get(char, [])
             self._all_crops.setdefault(char, []).extend(crops)
             self._all_boxes.setdefault(char, []).extend(boxes)
@@ -1158,26 +1291,46 @@ class MainWindow(QMainWindow):
         self._clear_grid()
         if not self._source_images:
             return
-        cols = max(1, (self.width() - 60) // 118)
+        cols = max(1, (self._grid_widget.width() - 60) // 118)
+
         extras = sorted(c for c in self._all_crops if c not in EXPECTED_CHARS)
-        ordered = EXPECTED_CHARS + extras
-        for i, char in enumerate(ordered):
-            if char in self._all_crops:
-                crops = self._all_crops[char]
-                idx   = self._selected.get(char, 0)
-                idx   = min(idx, len(crops) - 1)
-                card  = CharCard(char, crops[idx], len(crops))
-                card.clicked.connect(self._on_card_clicked)
-            else:
-                card = PlaceholderCard(char)
-                card.clicked.connect(self._on_placeholder_clicked)
+        # Filled cards first (in canonical order), then placeholders for the
+        # rest. Keeps filled chars contiguous so reassigning lots of crops
+        # never leaves visual gaps in the middle of the grid.
+        filled = [c for c in EXPECTED_CHARS if c in self._all_crops] + extras
+        placeholders = [c for c in EXPECTED_CHARS if c not in self._all_crops]
+
+        i = 0
+        for char in filled:
+            crops = self._all_crops[char]
+            idx   = self._selected.get(char, 0)
+            idx   = min(idx, len(crops) - 1)
+            card  = CharCard(char, crops[idx], len(crops), locked=char in self._locked)
+            card.clicked.connect(self._on_card_clicked)
+            card.right_clicked.connect(self._toggle_lock)
             self._grid_layout.addWidget(card, i // cols, i % cols)
             self._cards[char] = card
+            i += 1
+        for char in placeholders:
+            card = PlaceholderCard(char)
+            card.clicked.connect(self._on_placeholder_clicked)
+            self._grid_layout.addWidget(card, i // cols, i % cols)
+            self._cards[char] = card
+            i += 1
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._source_images:
             self._populate_grid()
+
+    def _toggle_lock(self, char: str):
+        if char in self._locked:
+            self._locked.discard(char)
+        else:
+            self._locked.add(char)
+        card = self._cards.get(char)
+        if card is not None:
+            card.setLocked(char in self._locked)
 
     # ── picker ────────────────────────────────────────────────────────────────
     def _on_card_clicked(self, char: str):
@@ -1189,6 +1342,7 @@ class MainWindow(QMainWindow):
             self._box_sources.get(char, []),
             self._selected.get(char, 0),
             self,
+            super_resolution=self._sr_checkbox.isChecked(),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1235,6 +1389,93 @@ class MainWindow(QMainWindow):
         self._selected[char] = len(self._all_crops[char]) - 1
         self._populate_grid()
 
+    # ── font-wide preview ─────────────────────────────────────────────────────
+    def _show_font_preview(self):
+        if not self._all_crops:
+            return
+        try:
+            sr = self._sr_checkbox.isChecked()
+            char_dict = (
+                {c: list(self._all_crops[c]) for c in self._all_crops}
+                if sr else
+                {c: self._all_crops[c][self._selected.get(c, 0)] for c in self._all_crops}
+            )
+            # Reuse create_woff2 but write to a temp path to load.
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".ttf", delete=False) as tmp:
+                tmp_path = tmp.name
+            # We need a TTF (not WOFF2) for QFontDatabase. Build one inline.
+            from create_woff2 import (
+                _glyph_name, ndarray_to_glyph, ASCENDER, DESCENDER, UPM,
+            )
+            from fontTools.fontBuilder import FontBuilder
+            from fontTools.ttLib.tables._g_l_y_f import Glyph as EmptyGlyph
+            from super_resolution import merge_samples
+
+            glyph_order = [".notdef"]
+            cmap, metrics, glyphs = {}, {}, {}
+            for ch, arr in char_dict.items():
+                if isinstance(arr, list):
+                    arr = merge_samples(arr) if sr else arr[0]
+                name = _glyph_name(ch)
+                g, aw = ndarray_to_glyph(arr, raw=ch in ("i", "j"), char=ch)
+                glyph_order.append(name)
+                cmap[ord(ch)] = name
+                metrics[name] = (aw, 0)
+                glyphs[name] = g
+            metrics[".notdef"] = (UPM // 2, 0)
+            fb = FontBuilder(UPM, isTTF=True)
+            fb.setupGlyphOrder(glyph_order)
+            fb.setupCharacterMap(cmap)
+            fb.setupGlyf({".notdef": EmptyGlyph(), **glyphs})
+            fb.setupHorizontalMetrics(metrics)
+            fb.setupHorizontalHeader(ascent=ASCENDER, descent=DESCENDER)
+            fb.setupNameTable({"familyName": "FontPreview", "styleName": "Regular"})
+            fb.setupOS2(sTypoAscender=ASCENDER, sTypoDescender=DESCENDER,
+                        usWinAscent=ASCENDER, usWinDescent=abs(DESCENDER))
+            fb.setupPost()
+            fb.setupHead(unitsPerEm=UPM)
+            fb.font.save(tmp_path)
+
+            with open(tmp_path, "rb") as f:
+                ttf_bytes = f.read()
+            os.unlink(tmp_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Preview failed", str(e))
+            return
+
+        font_id = QFontDatabase.addApplicationFontFromData(QByteArray(ttf_bytes))
+        if font_id < 0:
+            QMessageBox.critical(self, "Preview failed", "Could not load generated font")
+            return
+        families = QFontDatabase.applicationFontFamilies(font_id)
+        family = families[0] if families else "FontPreview"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Font preview")
+        dlg.setStyleSheet(STYLESHEET + f"QDialog {{ background: {SURFACE}; }}")
+        dlg.resize(640, 480)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(20, 20, 20, 20)
+        v.setSpacing(12)
+
+        samples = [
+            ("The quick brown fox jumps over the lazy dog", 28),
+            ("abcdefghijklmnopqrstuvwxyz", 22),
+            ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 22),
+            ("0123456789  .,!?;:'\"()-", 22),
+        ]
+        for text, size in samples:
+            lbl = QLabel(text)
+            f = QFont(family); f.setPixelSize(size)
+            lbl.setFont(f)
+            lbl.setStyleSheet(f"color: {TEXT}; background: {BG}; padding: 8px; border-radius: 6px;")
+            lbl.setWordWrap(True)
+            v.addWidget(lbl)
+        v.addStretch(1)
+        dlg.exec()
+        QFontDatabase.removeApplicationFont(font_id)
+
     # ── save ──────────────────────────────────────────────────────────────────
     def _save(self):
         if not self._all_crops:
@@ -1249,8 +1490,21 @@ class MainWindow(QMainWindow):
             path += ".woff2"
         try:
             font_name = os.path.splitext(os.path.basename(path))[0]
-            char_dict = {char: self._all_crops[char][self._selected[char]] for char in self._all_crops}
-            create_woff2(char_dict, path, font_name)
+            sr = self._sr_checkbox.isChecked()
+            if sr:
+                # Pass user-selected crop first so single-sample chars use it,
+                # and multi-sample chars get the picked one as the median-area
+                # tiebreaker only via ordering — merge_samples will still
+                # pick its own reference. Cap at 10 inside the merger.
+                char_dict = {
+                    char: list(self._all_crops[char]) for char in self._all_crops
+                }
+            else:
+                char_dict = {
+                    char: self._all_crops[char][self._selected[char]]
+                    for char in self._all_crops
+                }
+            create_woff2(char_dict, path, font_name, super_resolution=sr)
             QMessageBox.information(self, "Saved", f"Font saved to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))

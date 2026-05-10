@@ -11,14 +11,42 @@ from fontTools.pens.cu2quPen import Cu2QuPen
 from fontTools.ttLib.tables._g_l_y_f import Glyph as EmptyGlyph
 from fontTools.agl import UV2AGL
 
+from super_resolution import merge_samples
+
 UPM = 1000
-GLYPH_HEIGHT = 800
 CU2QU_MAX_ERR = 1.0
 OVERSAMPLE = 4  # upscale the crop before vtracer so sub-pixel detail (terminals, varying stroke width) survives
 _NORM_MARGIN = 0.12  # whitespace added around tight ink bbox, as fraction of the larger ink dimension
 
-ASCENDER = GLYPH_HEIGHT
-DESCENDER = GLYPH_HEIGHT - UPM
+# Three vertical zones — ascender, x-height, descender. x-height zone is 1.6×
+# the ascender (and descender) zone so lowercase round letters end up shorter
+# than caps/ascenders, the way real fonts do.
+ASCENDER  = 800              # baseline -> cap-height/ascender top
+X_RATIO   = 2              # x-height zone / asc zone (== / desc zone)
+X_HEIGHT  = int(ASCENDER * X_RATIO / (1.0 + X_RATIO))  # 492
+DESCENDER = -(ASCENDER - X_HEIGHT)  # -308; symmetric with ascender zone
+GLYPH_HEIGHT = ASCENDER  # kept for any legacy reference
+
+DESCENDER_CHARS = set("gpqy")
+ASCENDER_LOWER  = set("bdfhklt")
+X_HEIGHT_CHARS  = set("acemnorsuvwxz")
+# i/j are special-cased (tittle handling).
+
+
+def _char_metrics(char: str) -> tuple[int, int]:
+    """Return (target_height, baseline_offset) for a non-i/j character.
+
+    The image is scaled so its height maps to `target_height` font units,
+    and the bottom of the image lands at y=`baseline_offset` in font space.
+    """
+    if char in DESCENDER_CHARS:
+        return X_HEIGHT - DESCENDER, DESCENDER          # 800, -308
+    if char in ASCENDER_LOWER or (len(char) == 1 and (char.isupper() or char.isdigit())):
+        return ASCENDER, 0                              # 800, 0
+    if char in X_HEIGHT_CHARS:
+        return X_HEIGHT, 0                              # 492, 0
+    # Punctuation / fallback: sit on baseline at x-height.
+    return X_HEIGHT, 0
 
 # vtracer tuning — adjust these to trade smoothness vs. fidelity
 VTRACER_PARAMS = dict(
@@ -46,18 +74,14 @@ def _normalize_ink(img: np.ndarray) -> np.ndarray:
     return img[y1:y2, x1:x2]
 
 
-def _svg_to_pen(svg: str, pen, img_h: int, img_w: int):
+def _svg_to_pen(svg: str, pen, img_h: int, img_w: int, scale: float, baseline: float = 0.0):
     """Parse vtracer SVG paths and replay them into a fontTools pen.
 
-    Applies a y-flip so image coords (origin top-left) become font coords
-    (origin bottom-left). vtracer outer contours are CCW in image space;
-    after flip they become CW — correct for TrueType.
-    Cu2QuPen (reverse_direction=True) handles any remaining winding issues.
+    `scale` is image-px → font-units. `baseline` is the font-space y at which
+    the bottom of the image sits (negative for descender chars).
     """
-    scale = GLYPH_HEIGHT / img_h
-
     def pt(x, y):
-        return (float(x) * scale, float(img_h - y) * scale)
+        return (float(x) * scale, (float(img_h) - float(y)) * scale + baseline)
 
     # vtracer emits one <path> per contour, each with its own
     # transform="translate(tx, ty)". Honour it when replaying.
@@ -100,7 +124,7 @@ def _svg_to_pen(svg: str, pen, img_h: int, img_w: int):
                 pen.closePath()
 
 
-def _add_tittle_to_pen(pen, processed: np.ndarray, img_h: int):
+def _add_tittle_to_pen(pen, processed: np.ndarray, img_h: int, scale: float, baseline: float = 0.0):
     """Append a circular tittle as a separate contour to the glyph pen.
 
     Diameter = thinnest stem width (min over rows of the longest ink run in
@@ -133,9 +157,8 @@ def _add_tittle_to_pen(pen, processed: np.ndarray, img_h: int):
     gap_img    = float(min_run)
     cy_img = top_y - gap_img - radius_img
 
-    scale = GLYPH_HEIGHT / img_h
     cx = cx_img * scale
-    cy = (img_h - cy_img) * scale
+    cy = (img_h - cy_img) * scale + baseline
     r  = radius_img * scale
     k  = 0.5522847498307936 * r  # cubic-bezier circle handle length
 
@@ -170,21 +193,24 @@ def ndarray_to_glyph(image: np.ndarray, raw: bool = False, char: str | None = No
             interpolation=cv2.INTER_CUBIC,
         )
 
+    body_height: int | None = None  # set for i/j after CC isolation
     if char in ("i", "j"):
-        # Strip any existing tittle / stray ink — we redraw a clean circular
-        # dot below — by keeping only the tallest connected component (the
-        # body). Then top-pad with white so the new tittle fits inside the
-        # image bounds (and thus inside ASCENDER in font space).
+        # Strip any existing tittle / stray ink by keeping only the tallest
+        # connected component (the body). Pad above with white so the
+        # programmatic tittle fits inside the image bounds.
         _, _m = cv2.threshold(processed, 0, 255,
                               cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         n_cc, _labels, _stats, _ = cv2.connectedComponentsWithStats(_m, connectivity=8)
         if n_cc > 1:
             heights = _stats[1:, cv2.CC_STAT_HEIGHT]
-            body_label = 1 + int(np.argmax(heights))
+            body_idx = int(np.argmax(heights))
+            body_label = 1 + body_idx
+            body_height = int(_stats[body_label, cv2.CC_STAT_HEIGHT])
             body_mask = (_labels == body_label).astype(np.uint8) * 255
-            # Repaint processed: white everywhere except where body ink was.
             processed = np.where(body_mask > 0, processed, 255).astype(np.uint8)
             _m = body_mask
+        else:
+            body_height = int(processed.shape[0])
         if cv2.countNonZero(_m):
             row_stems = []
             for _y in range(_m.shape[0]):
@@ -206,25 +232,40 @@ def ndarray_to_glyph(image: np.ndarray, raw: bool = False, char: str | None = No
     img_bytes = buf.getvalue()
 
     h, w = processed.shape
+
+    # Per-class scaling + baseline offset.
+    if char == "i":
+        # Body fills x-height; the top-pad pixels naturally extend above into
+        # the ascender zone where the programmatic tittle lives.
+        scale    = X_HEIGHT / max(1, body_height or h)
+        baseline = 0.0
+    elif char == "j":
+        # Body spans descender to x-height (full asc-height worth of pixels).
+        scale    = (X_HEIGHT - DESCENDER) / max(1, body_height or h)
+        baseline = float(DESCENDER)
+    else:
+        target_h, baseline_int = _char_metrics(char or "")
+        scale    = target_h / h
+        baseline = float(baseline_int)
+
     params = {**VTRACER_PARAMS, "filter_speckle": 0, "length_threshold": 0.0} if raw else VTRACER_PARAMS
     svg  = vtracer.convert_raw_image_to_svg(img_bytes, img_format="png", **params)
     if os.environ.get("FONT_DEBUG"):
-        print(f"[debug] processed shape={processed.shape}  scale={GLYPH_HEIGHT/h:.3f}")
+        print(f"[debug] char={char!r} processed={processed.shape} scale={scale:.3f} baseline={baseline:.1f}")
         with open("/tmp/font_debug.svg", "w") as _f:
             _f.write(svg)
         cv2.imwrite("/tmp/font_debug_processed.png", processed)
-        print("[debug] wrote /tmp/font_debug.svg and /tmp/font_debug_processed.png")
 
     tt_pen = TTGlyphPen(glyphSet=None)
     pen    = Cu2QuPen(tt_pen, max_err=CU2QU_MAX_ERR, reverse_direction=True)
 
-    _svg_to_pen(svg, pen, h, w)
+    _svg_to_pen(svg, pen, h, w, scale, baseline)
 
     if char in ("i", "j"):
-        _add_tittle_to_pen(pen, processed, h)
+        _add_tittle_to_pen(pen, processed, h, scale, baseline)
 
-    glyph        = tt_pen.glyph()
-    advance_width = int(w * (GLYPH_HEIGHT / h) + 100)
+    glyph         = tt_pen.glyph()
+    advance_width = int(w * scale + 100)
     return glyph, advance_width
 
 
@@ -232,14 +273,16 @@ def _glyph_name(char: str) -> str:
     return UV2AGL.get(ord(char), f"uni{ord(char):04X}")
 
 
-def create_woff2(char_arrays: dict[str, np.ndarray], output_path: str, font_name: str = "CustomFont"):
+def create_woff2(
+    char_arrays: dict[str, "np.ndarray | list[np.ndarray]"],
+    output_path: str,
+    font_name: str = "CustomFont",
+    super_resolution: bool = False,
+):
     """
-    Build a woff2 font from a mapping of character -> BGR np.ndarray crop.
-
-    Args:
-        char_arrays: dict mapping each character (e.g. 'a') to its image crop.
-        output_path:  destination .woff2 file path.
-        font_name:    font family name embedded in the name table.
+    Build a woff2 font from a mapping of character -> BGR np.ndarray crop, or
+    character -> list of crops when `super_resolution=True` (multiple samples
+    are aligned and median-stacked into a single sharper crop).
     """
     glyph_order = [".notdef"]
     cmap = {}
@@ -247,6 +290,8 @@ def create_woff2(char_arrays: dict[str, np.ndarray], output_path: str, font_name
     glyph_objects = {}
 
     for char, arr in char_arrays.items():
+        if isinstance(arr, list):
+            arr = merge_samples(arr) if super_resolution else arr[0]
         name = _glyph_name(char)
         glyph, advance_width = ndarray_to_glyph(arr, raw=char in ("i", "j"), char=char)
         glyph_order.append(name)
@@ -278,8 +323,20 @@ def create_woff2(char_arrays: dict[str, np.ndarray], output_path: str, font_name
     return font
 
 
-def generate_preview_ttf(char: str, crop: np.ndarray, family_name: str = "FontBuilderPreview") -> bytes:
-    """Generate an in-memory TTF for a single character, for Qt preview use."""
+def generate_preview_ttf(
+    char: str,
+    crop: "np.ndarray | list[np.ndarray]",
+    family_name: str = "FontBuilderPreview",
+    super_resolution: bool = False,
+) -> bytes:
+    """Generate an in-memory TTF for a single character, for Qt preview use.
+
+    `crop` may be a single BGR ndarray or a list of crops. When
+    `super_resolution=True` and a list is given, samples are aligned and
+    median-stacked into a single sharper crop before glyph generation.
+    """
+    if isinstance(crop, list):
+        crop = merge_samples(crop) if super_resolution else crop[0]
     name = _glyph_name(char)
     glyph, advance_width = ndarray_to_glyph(crop, raw=char in ("i", "j"), char=char)
 

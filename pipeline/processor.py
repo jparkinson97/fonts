@@ -13,12 +13,12 @@ from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from detect_character import segment_characters_with_boxes
+from detect_character import segment_characters_with_boxes, attach_dot_above
 from classify_character_easyocr import preprocess
 
 from create_woff2 import create_woff2
 
-_WHITELIST = string.ascii_letters + string.digits + r""".,!?;:'"()-"""
+_WHITELIST = string.ascii_letters + string.digits + r""".,!?;:()-"""
 _OCR_CONFIG = (
     "--oem 3 --psm 10 "
     f"-c tessedit_char_whitelist={_WHITELIST}"
@@ -104,12 +104,22 @@ def build_char_dict(
             if progress_callback:
                 progress_callback(completed, len(crops))
 
+    # Median body height for sizing the dot-search window
+    median_h = float(np.median([h for _, _, _, h in boxes])) if boxes else 0.0
+
     char_dict: dict[str, list[np.ndarray]] = {}
     box_dict:  dict[str, list[tuple[int, int, int, int]]] = {}
     for (crop, box), char in zip(zip(crops, boxes), chars):
-        if len(char) == 1:
-            char_dict.setdefault(char, []).append(crop)
-            box_dict.setdefault(char, []).append(box)
+        if len(char) != 1:
+            continue
+        if char in ("i", "j"):
+            new_box = attach_dot_above(box, orig_img, median_h)
+            if new_box != box:
+                nx, ny, nw, nh = new_box
+                crop = orig_img[ny : ny + nh, nx : nx + nw]
+                box = new_box
+        char_dict.setdefault(char, []).append(crop)
+        box_dict.setdefault(char, []).append(box)
     _t(f"classify ({len(char_dict)} unique chars)", t)
 
     if not char_dict:

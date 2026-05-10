@@ -111,6 +111,73 @@ class PreviewWorker(QThread):
             self.error.emit(str(e))
 
 
+# ── pixel editor widget ───────────────────────────────────────────────────────
+class PixelEditor(QFrame):
+    """Click/drag to toggle pixels between black and white."""
+
+    changed = pyqtSignal()
+    TARGET = 280  # max px on the longest side of the displayed grid
+
+    def __init__(self, binary: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background: white; border: 1px solid {BORDER}; border-radius: 6px;")
+        self._bin = binary.copy().astype(np.uint8)
+        h, w = self._bin.shape
+        self._cell = max(2, self.TARGET // max(h, w))
+        self.setFixedSize(w * self._cell + 2, h * self._cell + 2)
+        self._drag_value: int | None = None
+        self._last_cell: tuple | None = None
+
+    def get_binary(self) -> np.ndarray:
+        return self._bin.copy()
+
+    def paintEvent(self, _ev):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        s = self._cell
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("black"))
+        ys, xs = np.where(self._bin == 0)
+        for y, x in zip(ys, xs):
+            painter.drawRect(1 + int(x) * s, 1 + int(y) * s, s, s)
+
+    def _cell_at(self, pos):
+        s = self._cell
+        h, w = self._bin.shape
+        cx = (pos.x() - 1) // s
+        cy = (pos.y() - 1) // s
+        if 0 <= cx < w and 0 <= cy < h:
+            return cy, cx
+        return None
+
+    def _paint_at(self, pos):
+        cell = self._cell_at(pos)
+        if cell is None or cell == self._last_cell:
+            return
+        cy, cx = cell
+        if self._drag_value is None:
+            self._drag_value = 255 if self._bin[cy, cx] == 0 else 0
+        self._bin[cy, cx] = self._drag_value
+        self._last_cell = cell
+        self.update()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._drag_value = None
+            self._last_cell = None
+            self._paint_at(ev.pos())
+
+    def mouseMoveEvent(self, ev):
+        if ev.buttons() & Qt.MouseButton.LeftButton:
+            self._paint_at(ev.pos())
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._drag_value = None
+            self._last_cell = None
+            self.changed.emit()
+
+
 # ── crop editor widget ────────────────────────────────────────────────────────
 class CropEditorWidget(QWidget):
     """Shows a padded region of the original image with a draggable bounding box."""
@@ -451,6 +518,8 @@ class PickerDialog(QDialog):
         self._pending_reassignments: list[tuple] = []
         self._preview_worker: PreviewWorker | None = None
         self._preview_counter = 0
+        self._pixel_editor: PixelEditor | None = None
+        self._pixel_editor_idx: int | None = None
 
         dlg_layout = QVBoxLayout(self)
         dlg_layout.setContentsMargins(0, 0, 0, 0)
@@ -530,6 +599,8 @@ class PickerDialog(QDialog):
         outer.addWidget(preview_hdr)
 
         preview_row = QHBoxLayout()
+        self._pixel_editor_holder = QHBoxLayout()
+        preview_row.addLayout(self._pixel_editor_holder)
         self._preview_lbl = QLabel(char)
         self._preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_lbl.setFixedSize(120, 120)
@@ -648,6 +719,8 @@ class PickerDialog(QDialog):
             sel = i in self._selected_indices
             btn.setStyleSheet(self._btn_style(sel))
             btn.setChecked(sel)
+        if self._pixel_editor_idx is not None and self._pixel_editor_idx not in self._selected_indices:
+            self._clear_pixel_editor()
         self._refresh_action_buttons()
 
     def _do_reassign(self):
@@ -689,12 +762,46 @@ class PickerDialog(QDialog):
         self._crops[idx] = new_crop
         self._btns[idx].setIcon(QIcon(crop_to_pixmap(new_crop, self.THUMB)))
 
+    def _clear_pixel_editor(self):
+        if self._pixel_editor is not None:
+            self._pixel_editor_holder.removeWidget(self._pixel_editor)
+            self._pixel_editor.deleteLater()
+            self._pixel_editor = None
+            self._pixel_editor_idx = None
+
+    def _ensure_pixel_editor(self, idx: int):
+        if self._pixel_editor is not None and self._pixel_editor_idx == idx:
+            return
+        self._clear_pixel_editor()
+        crop = self._crops[idx]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        h, w = binary.shape
+        pad = max(8, int(max(h, w) * 0.25))
+        binary = cv2.copyMakeBorder(binary, pad, pad, pad, pad,
+                                    cv2.BORDER_CONSTANT, value=255)
+        self._pixel_editor = PixelEditor(binary, self)
+        self._pixel_editor_idx = idx
+        self._pixel_editor.changed.connect(self._on_pixel_edit)
+        self._pixel_editor_holder.addWidget(self._pixel_editor)
+
+    def _on_pixel_edit(self):
+        if self._pixel_editor is None or self._pixel_editor_idx is None:
+            return
+        idx = self._pixel_editor_idx
+        binary = self._pixel_editor.get_binary()
+        bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        self._crops[idx] = bgr
+        if 0 <= idx < len(self._btns):
+            self._btns[idx].setIcon(QIcon(crop_to_pixmap(bgr, self.THUMB)))
+
     def _do_generate_preview(self):
         if self._preview_worker and self._preview_worker.isRunning():
             return
         if len(self._selected_indices) != 1 or not self._crops:
             return
         idx = next(iter(self._selected_indices))
+        self._ensure_pixel_editor(idx)
         self._preview_counter += 1
         family = f"FontBuilderPreview_{id(self):x}_{self._preview_counter}"
         self._preview_status.setText("Generating…")
